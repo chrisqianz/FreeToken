@@ -51,11 +51,11 @@ uv pip install -e ".[accel]"
 
 For More details:
 
-- [Install FreeToken](https://github.com/FlashML-org/FreeToken/blob/main/docs/install.md)
-- [Quick start](https://github.com/FlashML-org/FreeToken/blob/main/docs/quickstart.md)
-- [Supported models](https://github.com/FlashML-org/FreeToken/blob/main/docs/models.md)
-- [CLI reference](https://github.com/FlashML-org/FreeToken/blob/main/docs/cli.md)
-- [Repairing old FTW checkpoints](https://github.com/FlashML-org/FreeToken/blob/main/docs/ftw-hotfix.md)
+- [Install FreeToken](https://github.com/chrisqianz/FreeToken/blob/main/docs/install.md)
+- [Quick start](https://github.com/chrisqianz/FreeToken/blob/main/docs/quickstart.md)
+- [Supported models](https://github.com/chrisqianz/FreeToken/blob/main/docs/models.md)
+- [CLI reference](https://github.com/chrisqianz/FreeToken/blob/main/docs/cli.md)
+- [Repairing old FTW checkpoints](https://github.com/chrisqianz/FreeToken/blob/main/docs/ftw-hotfix.md)
 
 ## Citation
 
