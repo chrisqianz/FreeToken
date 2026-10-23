@@ -252,7 +252,7 @@ def test_pinned_uva_fp4_matches_gpu_resident():
 
     other = torch.randint(0, rows, (37, 16), device="cuda")
     assert torch.equal(pinned.lookup(other), oracle.lookup(other))
-    assert pinned.lookup(ids).shape == (37, 16, dim)
+    assert pinned.lookup(ids).shape == (37, 16 * dim)
 
 
 def test_gpu_resident_fp4_lookup_matches_the_lut():
