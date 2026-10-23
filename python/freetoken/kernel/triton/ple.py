@@ -33,7 +33,7 @@ def _e2m1_f32(n: tl.uint8) -> tl.float32:
     mant = (n & 1).to(tl.float32)
     exp2 = (n >> 1) & 3
     # exponent 0 is subnormal (0.mant); otherwise (1.mant) * 2 ** (exp2 - 1)
-    mag = tl.where(exp2 == 0, mant * 0.5, (1.0 + mant) * tl.where(exp2 == 1, 1.0, tl.where(exp2 == 2, 2.0, 4.0)))
+    mag = tl.where(exp2 == 0, mant * 0.5, (1.0 + mant * 0.5) * tl.where(exp2 == 1, 1.0, tl.where(exp2 == 2, 2.0, 4.0)))
     sign = ((n >> 3) & 1) * mag
     return mag - 2 * sign
 
