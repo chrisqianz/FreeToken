@@ -199,9 +199,18 @@ def iter_nvfp4_expert_pieces(
         for name in acts:
             del wanted[name]
         acts = []
+    # A CSF checkpoint keeps every input_scale in its own trailing shard; streaming them
+    # with the weights makes the first piece wait on that shard while all other tensors
+    # pile up in `pending` (the 93% load stall). The CSF path reads them out of band.
+    act_keys: dict[str, tuple[int, int, str]] = {}
+    if pair_kinds is not None:
+        for name in acts:
+            act_keys[name] = wanted.pop(name)
+        acts = list(act_keys)
     per_expert = (3 * (2 + len(pair_kinds)) + (3 if acts else 0)) if pair_kinds is not None else (12 if acts else 9)
-    if len(wanted) != experts * per_expert:
-        raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {experts * per_expert}")
+    streamed = per_expert - (3 if pair_kinds is not None and acts else 0)
+    if len(wanted) != experts * streamed:
+        raise ValueError(f"{spec.desc}: found {len(wanted)} expert tensors, expected {experts * streamed}")
 
     def _serial():
         by_shard: dict[str, list[str]] = collections.defaultdict(list)
@@ -232,14 +241,23 @@ def iter_nvfp4_expert_pieces(
     # same logical roles (plus the W4A4 input scales when the set is complete), decoding
     # the scale pair on the fly.
     roles = list(spec.proj_to_role.values())
-    extras = [f"{role}_input" for role in roles] if acts else []
     slots_per_expert = {
         slot
         for role in roles
-        for slot in [f"{role}", f"{role}_global", *(f"{role}~{kind}" for kind in pair_kinds), *extras]
+        for slot in [f"{role}", f"{role}_global", *(f"{role}~{kind}" for kind in pair_kinds)]
     }
+    act_index = {key: name for name, key in act_keys.items()}
 
     def _csf_pieces():
+        acts_in: dict[str, torch.Tensor] = {}
+        if act_keys:
+            act_shards: dict[str, list[str]] = collections.defaultdict(list)
+            for name in act_keys:
+                act_shards[weight_map[name]].append(name)
+            for shard in tqdm(sorted(act_shards), desc=f"Loading {spec.desc} scales", disable=not primary):
+                with safetensors.safe_open(os.path.join(folder, shard), framework="pt", device="cpu") as f:
+                    for name in act_shards[shard]:
+                        acts_in[name] = _ingest(spec, act, act_keys[name][2], f.get_tensor(name))
         pending: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
         for name, tensor in _parallel() if parallel else _serial():
             layer, expert, slot = wanted[name]
@@ -253,7 +271,7 @@ def iter_nvfp4_expert_pieces(
                 grouped[role] = piece[role].unsqueeze(0)
                 grouped[f"{role}_global"] = piece[f"{role}_global"].reshape(1, -1)
                 if acts:
-                    grouped[f"{role}_input"] = piece[f"{role}_input"].reshape(1, -1)
+                    grouped[f"{role}_input"] = acts_in[act_index[(layer, expert, f"{role}_input")]].reshape(1, -1)
                 grouped[f"{role}_scale"] = decoder(
                     *[piece[f"{role}~{kind}"] for kind in pair_kinds]
                 ).unsqueeze(0)

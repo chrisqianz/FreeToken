@@ -6,6 +6,7 @@ The tensors are tiny but the key names, dtypes and the fusion geometry that matt
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import random
 from types import SimpleNamespace
@@ -248,6 +249,85 @@ def test_csf_expert_reader_expands_the_scale_pieces(tmp_path):
             )
             assert piece[f"{role}_scale"].shape == (1, raw[f"{base}.weight"].shape[0], raw[f"{base}.weight"].shape[1] // 8)
             assert torch.equal(piece[f"{role}_scale"].view(torch.uint8)[0], refs[(e0, proj)])
+
+
+def test_csf_pieces_decoder_errors_surface_to_the_consumer(tmp_path):
+    """A raising scale decoder must fail the stream, not silently drop pieces."""
+    raw, _refs = _csf_expert_raw()
+    quant = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0,))
+    folder, _full = _write_checkpoint(tmp_path, raw, quant)
+    install_quant_config(folder)
+    spec = nvfp4_expert_spec(folder, None)
+    calls = iter(range(99))
+
+    def boom(fixed, exceptions):
+        if next(calls) == 4:
+            raise RuntimeError("decoder boom")
+        return decode_csf_scales(fixed, exceptions)
+
+    spec = dataclasses.replace(spec, scale_decoder=boom)
+    config = SimpleNamespace(num_experts=2, num_layers=1, first_k_dense_replace=0)
+    with pytest.raises(RuntimeError, match="decoder boom"):
+        list(iter_nvfp4_expert_pieces(folder, config, spec))
+
+
+def test_csf_expert_reader_parallel_matches_serial(tmp_path):
+    """The O_DIRECT parallel reader (the production path) expands CSF pairs identically."""
+    raw, refs = _csf_expert_raw()
+    quant = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0,))
+    folder, _full = _write_checkpoint(tmp_path, raw, quant)
+    install_quant_config(folder)
+    spec = nvfp4_expert_spec(folder, None)
+    config = SimpleNamespace(num_experts=2, num_layers=1, first_k_dense_replace=0)
+    pieces = list(iter_nvfp4_expert_pieces(folder, config, spec, parallel=True, workers=2, chunk=1 << 20))
+    assert sorted(p[1] for p in pieces) == [0, 1]
+    for _layer, e0, e1, piece in pieces:
+        assert (e0, e1) == (0, 1) or (e0, e1) == (1, 2)
+        for proj, role in (("gate_proj", "gate"), ("up_proj", "up"), ("down_proj", "down")):
+            base = f"model.language_model.layers.0.mlp.experts.{e0}.{proj}"
+            assert piece[f"{role}_scale"].shape == (1, raw[f"{base}.weight"].shape[0], raw[f"{base}.weight"].shape[1] // 8)
+            assert torch.equal(piece[f"{role}_scale"].view(torch.uint8)[0], refs[(e0, proj)])
+
+
+def test_csf_pieces_read_activation_scales_out_of_band(tmp_path, monkeypatch):
+    """input_scale rides no part of the expert stream.
+
+    The FP4-Local checkpoint keeps every input_scale in one trailing shard; streaming
+    them made the first piece wait on that shard with all weights already in hand.
+    """
+    from freetoken.models import weight as models_weight
+
+    probed: list = []
+    real = models_weight.iter_expert_tensors_parallel
+
+    def spy(folder, is_expert, **kwargs):
+        probed.append(is_expert)
+        yield from real(folder, is_expert, **kwargs)
+
+    monkeypatch.setattr(models_weight, "iter_expert_tensors_parallel", spy)
+    quant = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0,))
+    raw, _refs = _csf_expert_raw()
+    # mimic the real checkpoint: the whole input_scale set lives in its own shard
+    act_tensors = {name: raw.pop(name) for name in list(raw) if name.endswith(".input_scale")}
+    assert len(act_tensors) == 6
+    folder, _full = _write_checkpoint(tmp_path, raw, quant)
+    save_file(act_tensors, str(tmp_path / "model-act-00000.safetensors"))
+    assert folder == str(tmp_path)
+    install_quant_config(folder)
+    spec = nvfp4_expert_spec(folder, None)
+    config = SimpleNamespace(num_experts=2, num_layers=1, first_k_dense_replace=0)
+    pieces = list(iter_nvfp4_expert_pieces(folder, config, spec, parallel=True, workers=2, chunk=1 << 20))
+    assert len(pieces) == 2
+    for _layer, _e0, _e1, piece in pieces:
+        for role in ("gate", "up", "down"):
+            assert piece[f"{role}_input"].dtype is torch.float32
+    assert probed
+    want = probed[0]
+    for expert in range(2):
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            base = f"model.language_model.layers.0.mlp.experts.{expert}.{proj}"
+            assert not want(f"{base}.input_scale")
+            assert want(f"{base}.weight")
 
 
 def _raw_checkpoint(dense_fp8: bool = False, channel_fp8: bool = False, mxfp8_scale: str | None = None) -> dict[str, torch.Tensor]:
