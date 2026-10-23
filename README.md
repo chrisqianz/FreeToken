@@ -56,6 +56,7 @@ For More details:
 - [Supported models](https://github.com/chrisqianz/FreeToken/blob/main/docs/models.md)
 - [CLI reference](https://github.com/chrisqianz/FreeToken/blob/main/docs/cli.md)
 - [Repairing old FTW checkpoints](https://github.com/chrisqianz/FreeToken/blob/main/docs/ftw-hotfix.md)
+- [Diagnosing a checkpoint that fails to load](https://github.com/chrisqianz/FreeToken/blob/main/scripts/checkpoint_diagnose/README.md)
 
 ## Citation
 

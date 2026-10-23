@@ -48,8 +48,10 @@ _BANK_SCHEMAS: dict[str, tuple[str, ...]] = {
     "fp8_block": ("gate_up", "gate_up_scale", "down", "down_scale"),
     # GGUF experts in their own ggml type per layer: gate_up [L*E, 2I, row_bytes] (gate rows, then up rows), down [L*E, H, row_bytes]; float experts keep their dtype
     "gguf": ("gate_up", "down"),
+    # GGUF experts whose NVFP4 tensors carry per-expert scales: global [L*E, 4] fp32 (gate, up, down, 1) weight_scale_2
+    "gguf_scaled": ("gate_up", "down", "global"),
     # native ModelOpt rows for the Triton inline-dequant kernels: packed e2m1 codes +
-    # fp8-e4m3 per-16 block scales + per-output-row fp16 globals (w1/w3 carry distinct
+    # fp8-e4m3 per-16 block scales + per-output-row fp32 globals (w1/w3 carry distinct
     # globals, and folding them into the e4m3 block scales would underflow)
     "nvfp4": (
         "gate_up_packed",
@@ -92,7 +94,7 @@ _BANK_BYTES_PER_EXPERT = {
         (2 * I // 128) * fp8_block_scale_pad(2 * I // 128, H // 128)
         + (H // 128) * fp8_block_scale_pad(H // 128, I // 128)
     ) * 2,
-    "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 2) + H * (I // 2 + I // 16 + 2),
+    "nvfp4": lambda H, I: 2 * I * (H // 2 + H // 16 + 4) + H * (I // 2 + I // 16 + 4),
     "mxfp4": lambda H, I: 2 * I * (H // 2 + H // 32 + 2) + H * (I // 2 + I // 32 + 2),
     "ds_fp4": lambda H, I: 2 * I * (H // 2 + H // 32) + H * (I // 2 + I // 32),
 }
@@ -100,6 +102,11 @@ _BANK_BYTES_PER_EXPERT = {
 # vLLM's marlin grouped-GEMM hands the full [cache_size] slot cache as its expert
 # dimension; moe_align_block_size requires round_up(experts, 32) < 1024, i.e. <= 992.
 MARLIN_MAX_CACHE_SIZE = 992
+
+
+def placeholder_bank(num_experts: int) -> torch.Tensor:
+    """The source of a bank whose role a layer's expert kernel does not read (experts of several formats): zero bytes per row."""
+    return torch.empty((num_experts, 0), dtype=torch.uint8)
 
 
 def bank_layouts(sources: dict[str, list[torch.Tensor]], layer_tags: list | None = None) -> list[tuple]:
@@ -145,15 +152,18 @@ class OffloadMoeCache:
     # of that step's misses are computed on the CPU. 0 -> never fetch (CPU does every
     # miss, the GPU cache stays cold); large -> behaves like pure offload.
     hybrid_max_fetch: int = 1
-    # hybrid only: when > 0, replaces the fixed cap with a per-step fraction -- fetch
+    # hybrid only, one per MoE layer: when > 0, replaces the fixed cap with a per-step fraction -- fetch
     # ~fraction * misses experts over PCIe (rounded to whichever integer balances the
     # overlap best), the CPU computes the rest. The engine sets it to the benched
     # pcie_bw / cpu_bw ratio so the PCIe fetch and the CPU overflow GEMV take equal
     # time (perfect overlap): fetched : cpu = pcie : cpu - pcie.
-    hybrid_fetch_fraction: float = 0.0
+    hybrid_fetch_fraction: list[float] | None = None
     # bank layout from the expert kernel (a BankSpec per role); when given it replaces the _BANK_SCHEMAS lookup and the slot cap comes from max_slots
     layout: dict | None = None
     max_slots: int | None = None
+    # Per-layer kernel layouts for experts of several formats (replaces ``layout``). The banks are the union of their roles;
+    # a layer whose kernel reads no such role carries a zero-byte [num_experts, 0] uint8 placeholder (see placeholder_bank).
+    layer_layouts: list[dict] | None = None
     # Each layer belongs to one pool: a contiguous slot range with its own LRU scope; pool p owns slots [sum(pool_sizes[:p]), +pool_sizes[p]). Slot ids in slot_for_id are local to the pool. None = one pool for all layers.
     pool_of_layer: list[int] | None = None
     pool_sizes: list[int] | None = None
@@ -162,7 +172,12 @@ class OffloadMoeCache:
         policy_ids = {"lru": 0}
         assert self.cache_policy in policy_ids
         assert self.decode_target in ("gpu", "cpu", "hybrid"), self.decode_target
-        if self.layout is None:
+        if self.layer_layouts is not None:
+            assert self.layout is None, "pass layout or layer_layouts, not both"
+            assert len(self.layer_layouts) == self.num_layers, (len(self.layer_layouts), self.num_layers)
+            if any(spec.resident for layout in self.layer_layouts for spec in layout.values()):
+                raise ValueError("experts of several formats cannot use a kernel with GPU-resident alphas (marlin, b12x)")
+        elif self.layout is None:
             assert self.quant_format in _BANK_SCHEMAS, f"unknown quant_format {self.quant_format!r}"
         if self.pool_sizes is None:
             self.pool_of_layer = [0] * self.num_layers
@@ -179,6 +194,9 @@ class OffloadMoeCache:
         # offload/PCIe path. Set by the engine after construction (empty = all-GPU,
         # all layers = the plain --moe-strategy cpu case).
         self.cpu_layer_ids: frozenset = frozenset()
+        # hybrid: locked (unpinned) layers that keep slots of their own pools and fetch part of their misses through locked_fetch's pinned staging
+        self.locked_hybrid: frozenset = frozenset()
+        self.locked_fetch = None  # moe.locked_fetch.LockedLayerFetch, set by the engine with locked_hybrid
         # Bank row layouts, set by set_bank_sources: layouts[g][k] is (dtype, row shape) of bank k (layouts of two quant tags may be equal), layer_layout[l] is layer l's g.
         # With one (dtype, row shape) per bank a bank cache is typed [cache_size, *row]; with several, or with pads, it is a byte segment each pool views with its own layout.
         self.layouts: list[tuple[tuple[torch.dtype, tuple[int, ...]], ...]] = []
@@ -231,13 +249,17 @@ class OffloadMoeCache:
         # carry independent host attributes -- see layer_residency) and their GPU
         # slot caches, keyed by the format's bank schema (attached by
         # set_bank_sources). The GPU slot cache stays one unified pool per bank.
-        if self.layout is not None:
+        if self.layer_layouts is not None:
+            self.bank_schema = tuple(dict.fromkeys(
+                role for layout in self.layer_layouts for role, spec in layout.items() if not spec.resident
+            ))
+        elif self.layout is not None:
             self.bank_schema = tuple(role for role, spec in self.layout.items() if not spec.resident)
         else:
             self.bank_schema = _BANK_SCHEMAS[self.quant_format]
         self.bank_sources: dict[str, list[torch.Tensor]] = {}
         self.bank_caches: dict[str, torch.Tensor] = {}
-        # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor and prefill via copy_missing's pageable branch
+        # per-layer host residency: the GPU movement paths require "pinned"; LOCKED/PAGEABLE layers decode on the CPU executor (locked_hybrid ones also from their slots) and prefill via copy_missing's pageable branch
         # _unpinned_layers is the derived id set the hot paths test against
         self.layer_residency: list[str] = []
         self._unpinned_layers: frozenset = frozenset()
@@ -295,6 +317,7 @@ class OffloadMoeCache:
         # _pending_whole_layer records WHICH staged it: the pageable branch is only sound after materialize_layer
         self._pending_src_layer: int | None = None
         self._pending_whole_layer = False
+        self._pending_fetch_cap: int | None = None  # the last hybrid ensure's cap on its fetch count
         # The two prefill staging buffers are the first 2 * _stage_bytes[k] bytes of every bank, on top of the first pools.
         # _stage_views[g][b] are buffer b's per-bank [num_experts, ...] views for layout g; _inval[b] are the global slots it overwrites.
         self._stage_bytes: list[int] = []
@@ -371,9 +394,9 @@ class OffloadMoeCache:
             for s, r, d in zip(self.pool_sizes[:-1], row, pad):
                 offsets[-1].append(offsets[-1][-1] + s * r + d)
         self._pool_offsets = offsets
-        # local slots below this index overlap the prefill staging area in some bank
+        # local slots below this index overlap the prefill staging area in some bank; a pool's zero-byte rows (a role its kernel does not read) overlap nothing
         self._pool_stable_from = [
-            max(min(max(-(-(2 * stage[k] - offsets[k][p]) // rows[k][p]), 0), s) for k in range(len(rows)))
+            max((min(max(-(-(2 * stage[k] - offsets[k][p]) // rows[k][p]), 0), s) for k in range(len(rows)) if rows[k][p]), default=0)
             for p, s in enumerate(self.pool_sizes)
         ]
         self._inval = []
@@ -382,6 +405,8 @@ class OffloadMoeCache:
             for k in range(len(rows)):
                 lo, hi = b * stage[k], (b + 1) * stage[k]
                 for p, (base, s) in enumerate(spans):
+                    if not rows[k][p]:
+                        continue
                     first = max((lo - offsets[k][p]) // rows[k][p], 0)
                     end = min(-(-(hi - offsets[k][p]) // rows[k][p]), s)
                     mask[base + first : base + max(first, end)] = True
@@ -447,7 +472,7 @@ class OffloadMoeCache:
         -- the cache machinery is layout-agnostic and just moves rows.
 
         ``layer_residency`` labels each layer with a ``HostResidency`` value (default: all pinned).
-        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must already be routed to the CPU executor (``cpu_layer_ids``, set BEFORE this call), the copy plan skips their rows, and their only movement is ``copy_missing``'s whole-layer pageable prefill branch -- which is why prefill overlap is incompatible with them.
+        Non-pinned (LOCKED/PAGEABLE) layers have no device address: they must be in ``cpu_layer_ids`` (set BEFORE this call) and the copy plan skips their rows. Prefill moves them with ``copy_missing``'s whole-layer pageable branch, so prefill overlap is incompatible with them; ``locked_hybrid`` layers also fetch decode misses through ``locked_fetch``.
 
         ``layer_tags`` names each layer's quant (see :func:`bank_layouts`); layers of different tags never share a pool.
 
@@ -488,8 +513,12 @@ class OffloadMoeCache:
             for layer_id, source in enumerate(per_layer):
                 assert source.is_contiguous(), f"bank {name!r} layer {layer_id} must be contiguous"
                 assert source.size(0) == self.num_experts, (name, layer_id, source.shape)
-                if self.layout is not None:
-                    spec = self.layout[name]
+                spec = self.layout[name] if self.layout is not None else None
+                if self.layer_layouts is not None:
+                    spec = self.layer_layouts[layer_id].get(name)
+                    if spec is None and source.numel() != 0:
+                        raise ValueError(f"layer {layer_id}'s expert kernel reads no {name!r} bank, so it takes a zero-byte placeholder")
+                if spec is not None:
                     if tuple(source.shape[1:]) != tuple(spec.shape) or source.dtype != spec.dtype:
                         raise ValueError(
                             f"bank {name!r} rows are {tuple(source.shape[1:])} {source.dtype} but the expert kernel's layout "
@@ -585,6 +614,9 @@ class OffloadMoeCache:
                     # unregistered layer: no device alias exists, and the row is never consumed (CPU decode; pageable prefill)
                     # a 0 placeholder keeps the descriptor shape
                     layer_src_ptrs[layer_id].append(0)
+                    continue
+                if source.numel() == 0:
+                    layer_src_ptrs[layer_id].append(0)  # placeholder bank: zero bytes per row, never dereferenced
                     continue
                 # The kernel dereferences these on the GPU, so store each host bank's
                 # device alias (== data_ptr() under UVA identity; differs on
@@ -756,11 +788,11 @@ class OffloadMoeCache:
 
     def is_cpu_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id`` decodes on the CPU executor (vs the GPU offload path)."""
-        return layer_id in self.cpu_layer_ids
+        return layer_id in self.cpu_layer_ids and layer_id not in self.locked_hybrid
 
     def is_unpinned_layer(self, layer_id: int) -> bool:
         """Whether ``layer_id``'s host banks have no device address (LOCKED/PAGEABLE): the GPU slot-gather paths cannot serve it.
-        ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id (never ``ensure_experts``'s LRU slot remap)."""
+        ``copy_missing`` takes the whole-layer pageable branch, which presumes materialize's position == expert id; a locked_hybrid layer's decode fetches go through ``locked_fetch`` instead."""
         return layer_id in self._unpinned_layers
 
     def alphas_for_slots(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor] | None:
@@ -980,6 +1012,8 @@ class OffloadMoeCache:
             dst, src, nbytes = [], [], []
             for b, feat in enumerate(self._row_bytes[layout]):
                 stage = self._copy_dst_ptrs_host[b] + buffer_id * self._stage_bytes[b]
+                if feat == 0:
+                    continue
                 if feat < _SMALL_BANK_FEAT_BYTES:
                     # Whole layer as one entry, EVEN with zero misses: it keeps every
                     # batch entry above the driver's async floor and covers the hit
@@ -1065,9 +1099,13 @@ class OffloadMoeCache:
             self.decode_freq[layer_id].scatter_add_(0, ids, torch.ones_like(ids))
         self._pending_src_layer = layer_id
         self._pending_whole_layer = False
-        return ensure_experts_hybrid(
-            self, layer_id, expert_ids, weights, self.hybrid_max_fetch, self.hybrid_fetch_fraction, clamp
-        )
+        fraction = self.hybrid_fetch_fraction[layer_id] if self.hybrid_fetch_fraction is not None else 0.0
+        max_fetch, cap = self.hybrid_max_fetch, None
+        if layer_id in self.locked_hybrid:
+            # a locked layer fetches through the staging, so at most its rows per step
+            (max_fetch, fraction), cap = self.locked_fetch.plan[layer_id], self.locked_fetch.max_fetch
+        self._pending_fetch_cap = cap
+        return ensure_experts_hybrid(self, layer_id, expert_ids, weights, max_fetch, fraction, clamp, cap)
 
     def materialize_layer(self, layer_id: int) -> None:
         from freetoken.moe.offload_kernels import materialize_layer
@@ -1126,6 +1164,29 @@ class OffloadMoeCache:
             "prefill_hit_rows": self.prefill_hit_rows,
             "prefill_rows": self.prefill_total_rows,
         }
+
+    def decode_stats_line(self) -> str | None:
+        """Decode stats since the last call by layer group (pinned, locked with slots, CPU-only), as one log line; zeroes the counters."""
+        if self.decode_target == "hybrid":
+            rows = torch.stack([self.stat_steps_layer, self.stat_active_layer, self.stat_missing_layer, self.stat_fetched_layer], 1).tolist()
+        else:
+            # offload copies every miss
+            cols = self.lru_stats.t()
+            rows = torch.stack([cols[Stat.CALLS], cols[Stat.ACTIVE], cols[Stat.MISS], cols[Stat.MISS]], 1).tolist()
+        self.reset_stats()
+        groups = (("pinned", [l for l in range(self.num_layers) if l not in self.cpu_layer_ids]), ("locked", sorted(self.locked_hybrid)))
+        parts = []
+        for name, layers in groups:
+            steps, active, missing, fetched = (sum(rows[l][k] for l in layers) for k in range(4))
+            if steps and active:
+                parts.append(
+                    f"{name} {_layers(len(layers))}: hit {1 - missing / active:.1%}, per layer-step "
+                    f"miss {missing / steps:.2f} fetch {fetched / steps:.2f} cpu {(missing - fetched) / steps:.2f}"
+                )
+        cpu_only = self.cpu_layer_ids - self.locked_hybrid
+        if cpu_only:
+            parts.append(f"cpu-only {_layers(len(cpu_only))}")
+        return "MoE decode, " + "; ".join(parts) if parts else None
 
     def decode_miss_stats_per_layer(self) -> dict:
         """Per-MoE-layer realized decode stats for one (reset_stats-delimited) window.
@@ -1195,13 +1256,16 @@ class OffloadMoeCache:
         assert layer_id is not None, "no staged misses (ensure_experts/materialize_layer first)"
         if layer_id in self._unpinned_layers:
             if not self._pending_whole_layer:
+                if layer_id in self.locked_hybrid:
+                    self.locked_fetch.copy(self, layer_id)
+                    return
                 raise RuntimeError(
                     f"layer {layer_id} is unpinned: its only copy is the whole-layer "
                     f"pageable materialize (position == expert id); ensure_experts's "
                     f"LRU slot remap cannot be honored without a device alias"
                 )
             # the only copy a non-pinned layer ever needs is the non-overlap prefill materialize, which schedules the whole layer into staging buffer 0 with position == expert id -- a plain synchronous pageable H2D copy
-            # never CUDA-graph captured: prefill is not captured, and decode never reaches this branch (it routes to the CPU executor)
+            # never CUDA-graph captured: prefill is not captured, and decode of an unpinned layer routes to the CPU executor or, locked_hybrid, to the staged fetch above
             for (per_layer, _), view in zip(self.banks, self.stage_views(layer_id, 0)):
                 view.copy_(per_layer[layer_id])
             return
@@ -1229,6 +1293,8 @@ class OffloadMoeCache:
 
         views = self.stage_views(layer_id, 0) if whole else self.pool_bank_views(layer_id)
         for (per_layer, _), cache in zip(self.banks, views):
+            if cache.numel() == 0:
+                continue
             fast_index_copy_jit(
                 cache,
                 self.evict_slots,
@@ -1236,6 +1302,10 @@ class OffloadMoeCache:
                 self.src_indices,
                 self.num_indices,
             )
+
+
+def _layers(n: int) -> str:
+    return f"{n} layer" if n == 1 else f"{n} layers"
 
 
 def iter_offload_moe_layers(model) -> Iterator:
