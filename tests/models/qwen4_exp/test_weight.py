@@ -114,9 +114,20 @@ def test_csf_decode_roundtrip():
         assert torch.equal(out.view(torch.uint8), ref)
         # the same records as a U32 byte stream
         assert torch.equal(decode_csf_scales(fixed, exc.view(torch.uint8)).view(torch.uint8), ref)
+        # the same records as their true uint32 dtype (sign-bit records included)
+        assert torch.equal(decode_csf_scales(fixed, exc.to(torch.uint32)).view(torch.uint8), ref)
         # with no exceptions the slab decode is the target itself (rows share a high nibble)
         no_exc = decode_csf_scales(fixed, torch.zeros(0, dtype=torch.int32))
         assert torch.equal(no_exc.view(torch.uint8), target)
+
+
+def test_csf_decode_rejects_streams_of_the_wrong_dtype():
+    target = _csf_target(32, 8, seed=1)
+    fixed, exc, _ref = _csf_encode(target)
+    with pytest.raises(ValueError, match="U32 records"):
+        decode_csf_scales(fixed, exc.to(torch.float32))
+    with pytest.raises(ValueError, match="expected U8"):
+        decode_csf_scales(fixed.to(torch.int32), exc)
 
 
 def test_rename_scaled_maps_the_checkpoint_scale_names_to_the_model_roles(monkeypatch):
@@ -171,15 +182,18 @@ def test_global_expander_broadcasts_the_scalar_once_its_weight_is_seen():
     assert g2.on_weight(module, 64) is None
     name, tensor = g2.on_global(module + ".weight_global", scalar)
     assert name == module + ".weight_global" and tensor.shape == (64,)
-    # a non-scalar global passes through untouched
+    # a full-width global passes through untouched; a miscounted one raises
+    full = torch.ones(64, dtype=torch.float16)
+    assert g2.on_global(module + ".weight_global", full) == (module + ".weight_global", full)
     row = torch.arange(3, dtype=torch.float16)
-    assert g2.on_global(module + ".weight_global", row) == (module + ".weight_global", row)
+    with pytest.raises(ValueError, match="holds 3 elements"):
+        g2.on_global(module + ".weight_global", row)
     g.check_complete()
     g2.check_complete()
     # a scalar that never met its weight fails the completeness assert
     g3 = qwen4_exp_weight._GlobalExpander()
     g3.on_global(module + ".weight_global", scalar)
-    with pytest.raises(AssertionError, match="without a weight"):
+    with pytest.raises(ValueError, match="without a weight"):
         g3.check_complete()
 
 
@@ -271,7 +285,7 @@ def test_csf_pieces_decoder_errors_surface_to_the_consumer(tmp_path):
         list(iter_nvfp4_expert_pieces(folder, config, spec))
 
 
-def test_csf_expert_reader_parallel_matches_serial(tmp_path):
+def test_csf_expert_reader_parallel_streams_csf_pieces(tmp_path):
     """The O_DIRECT parallel reader (the production path) expands CSF pairs identically."""
     raw, refs = _csf_expert_raw()
     quant = mixed_precision_quant(gdn_layers=(), attn_layers=(), moe_layers=(0,))

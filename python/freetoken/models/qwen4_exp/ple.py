@@ -90,7 +90,8 @@ class GpuResidentTable:
             self.num_rows, self.head_dim = weight.shape
         else:
             assert weight.dtype == torch.uint8, "packed PLE tables hold e2m1, two per byte"
-            assert scale_tensor.shape[0] == weight.shape[0] and weight.shape[1] % 8 == 0
+            assert scale_tensor.dtype == torch.float8_e4m3fn, "per-16 PLE scales are e4m3 bytes"
+            assert scale_tensor.shape == (weight.shape[0], weight.shape[1] // 8), "one scale per 16 values"
             self.num_rows = weight.shape[0]
             self.head_dim = weight.shape[1] * 2
             # e2m1: 0, +/-0.5, +/-1, +/-1.5, +/-2, +/-3, +/-4, +/-6 (sign = bit 3)

@@ -175,6 +175,11 @@ class _GlobalExpander:
     def on_global(self, name: str, tensor: torch.Tensor) -> tuple[str, torch.Tensor] | None:
         """A ready pair, or None for a scalar still waiting for its weight."""
         if tensor.numel() != 1:
+            rows = self._rows.get(name[: -len(".weight_global")])
+            if rows is not None and tensor.numel() != rows:
+                raise ValueError(
+                    f"{name} holds {tensor.numel()} elements for a weight with {rows} output rows"
+                )
             return name, tensor
         module = name[: -len(".weight_global")]
         if module in self._rows:
@@ -183,11 +188,26 @@ class _GlobalExpander:
         return None
 
     def check_complete(self) -> None:
-        assert not self._scalars, f"scalar weight_global without a weight: {sorted(self._scalars)}"
+        if self._scalars:
+            raise ValueError(f"scalar weight_global without a weight: {sorted(self._scalars)}")
 
     @staticmethod
     def _expand(module: str, scalar: torch.Tensor, rows: int) -> tuple[str, torch.Tensor]:
-        return module + ".weight_global", scalar.reshape(-1).to(torch.float32).expand(rows).contiguous()
+        return module + ".weight_global", _per_row_scale(scalar, rows)
+
+
+def _emit_vision(globals_: _GlobalExpander, name: str, tensor: torch.Tensor) -> Iterator[tuple[str, torch.Tensor]]:
+    """Yield one vision tensor, flushing a scalar ``weight_global`` once its weight is seen."""
+    if name.endswith(".weight_global"):
+        pair = globals_.on_global(name, tensor)
+        if pair is not None:
+            yield pair
+        return
+    yield name, tensor
+    if name.endswith(".weight"):
+        pair = globals_.on_weight(name.rpartition(".")[0], tensor.shape[0])
+        if pair is not None:
+            yield pair
 
 
 def _per_row_scale(scale: torch.Tensor, rows: int) -> torch.Tensor:
@@ -375,16 +395,7 @@ def iter_weights(
                     continue
                 tensor = f.get_tensor(raw_name)
                 if name.startswith(VISION_KEY_PREFIXES):
-                    if name.endswith(".weight_global"):
-                        pair = globals_.on_global(name, tensor)
-                        if pair is not None:
-                            yield pair
-                        continue
-                    yield name, tensor
-                    if name.endswith(".weight"):
-                        pair = globals_.on_weight(name[: -len(".weight")], tensor.shape[0])
-                        if pair is not None:
-                            yield pair
+                    yield from _emit_vision(globals_, name, tensor)
                     continue
                 emitted = reader.add(name, tensor)
                 if emitted is None:
@@ -409,17 +420,7 @@ def iter_vision_weights(model_path: str, device: torch.device) -> Iterator[tuple
                 if name is None or not name.startswith(VISION_KEY_PREFIXES):
                     continue
                 tensor = f.get_tensor(raw_name)
-                if name.endswith(".weight_global"):
-                    pair = globals_.on_global(name, tensor)
-                    if pair is None:
-                        continue
-                    yield pair
-                    continue
-                yield name, tensor
-                if name.endswith(".weight"):
-                    pair = globals_.on_weight(name.rpartition(".")[0], tensor.shape[0])
-                    if pair is not None:
-                        yield pair
+                yield from _emit_vision(globals_, name, tensor)
     globals_.check_complete()
 
 
@@ -516,8 +517,9 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
     folder = download_hf_weight(model_path)
     parts: dict[int, tuple[str, int, int]] = {}  # shard index -> (path, file offset, bytes)
     scale_parts: dict[int, tuple[str, int, int]] = {}
+    shapes: dict[int, tuple[int, ...]] = {}
+    scale_shapes: dict[int, tuple[int, ...]] = {}
     scale: torch.Tensor | None = None
-    rows = cols = 0
     dtype: torch.dtype | None = None
     # fp8 stays dtype-driven (F8_E4M3 or a bf16 table); nvfp4 packs e2m1, bf16 demands bf16
     _want_st = {"nvfp4": ("U8",), "bf16": ("BF16",), "fp8": ("F8_E4M3", "BF16")}[encoding]
@@ -541,31 +543,33 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
                 if dtype not in (None, shard_dtype):
                     raise ValueError(f"PLE table shard {key} mixes dtypes: {meta['dtype']} after {dtype}")
                 dtype = shard_dtype
-                shape = meta["shape"]
-                if rows and tuple(shape) != (rows, cols):
-                    raise ValueError(f"PLE table shard {key} is {shape}, expected {[rows, cols]}")
-                rows, cols = shape
+                index = int(match.group("shard"))
                 begin, end = meta["data_offsets"]
-                parts[int(match.group("shard"))] = (path, base + begin, end - begin)
+                parts[index] = (path, base + begin, end - begin)
+                shapes[index] = tuple(meta["shape"])
                 continue
             if encoding == "nvfp4":
                 match = _PLE_SHARD_SCALE_RE.search(key)
                 if match is not None:
                     if meta["dtype"] != "F8_E4M3":
                         raise ValueError(f"PLE scale shard {key} has dtype {meta['dtype']}, expected F8_E4M3")
-                    shape = meta["shape"]
-                    if rows and tuple(shape) != (rows, cols // 8):
-                        raise ValueError(f"PLE scale shard {key} is {shape}, expected {[rows, cols // 8]}")
+                    index = int(match.group("shard"))
                     begin, end = meta["data_offsets"]
-                    scale_parts[int(match.group("shard"))] = (path, base + begin, end - begin)
+                    scale_parts[index] = (path, base + begin, end - begin)
+                    scale_shapes[index] = tuple(meta["shape"])
 
     expected = int(qwen4_args.split_ngram_parts)
     if sorted(parts) != list(range(expected)):
         raise ValueError(
             f"PLE table needs shards 0..{expected - 1}, found {len(parts)}: {sorted(parts)[:8]}"
         )
+    if len(set(shapes.values())) > 1:
+        raise ValueError(f"PLE table shards disagree on shape: {sorted(set(shapes.values()))[:8]}")
+    rows, cols = shapes[min(shapes)]
     head_dim = qwen4_args.ngram_head_dim
     if encoding == "nvfp4":
+        if head_dim % 16:
+            raise ValueError(f"nvfp4 PLE heads must be a multiple of 16, got {head_dim}")
         if cols != head_dim // 2:
             raise ValueError(
                 f"PLE table row is {cols} packed bytes, config says {head_dim // 2} for a {head_dim}-dim head"
@@ -574,6 +578,10 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
             raise ValueError(
                 f"PLE table needs scale shards 0..{expected - 1}, found {len(scale_parts)}: {sorted(scale_parts)[:8]}"
             )
+        want = (rows, cols // 8)
+        for shard in sorted(scale_shapes):
+            if scale_shapes[shard] != want:
+                raise ValueError(f"PLE scale shard {shard} is {list(scale_shapes[shard])}, expected {list(want)}")
     elif cols != head_dim:
         raise ValueError(f"PLE table row is {cols} wide, config says {head_dim}")
     if scale is None:
@@ -590,7 +598,8 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
         buf = bank.memoryview()
         for shard in range(expected):
             path, offset, nbytes = parts[shard]
-            assert nbytes == shard_bytes, f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}"
+            if nbytes != shard_bytes:
+                raise ValueError(f"PLE shard {shard} is {nbytes} B, expected {shard_bytes}")
             read_range_into(buf, path, file_offset=offset, nbytes=nbytes,
                             dest_offset=shard * shard_bytes, workers=workers, chunk=chunk)
             bar.update(nbytes)
@@ -606,7 +615,8 @@ def load_ple_table(model_path: str, qwen4_args, *, pin: bool = True,
             sbuf = scale_bank.memoryview()
             for shard in range(expected):
                 path, offset, nbytes = scale_parts[shard]
-                assert nbytes == scale_shard_bytes, f"PLE scale shard {shard} is {nbytes} B, expected {scale_shard_bytes}"
+                if nbytes != scale_shard_bytes:
+                    raise ValueError(f"PLE scale shard {shard} is {nbytes} B, expected {scale_shard_bytes}")
                 read_range_into(sbuf, path, file_offset=offset, nbytes=nbytes,
                                 dest_offset=shard * scale_shard_bytes, workers=workers, chunk=chunk)
                 bar.update(nbytes)
@@ -634,7 +644,7 @@ def nvfp4_expert_spec(model_path: str, config) -> Nvfp4ExpertSourceSpec:
     stored = quant.stored_tensors(QuantKind.NVFP4)
     kind_map = {stored[role].name: kind for role, kind in _BANK_KINDS.items()}
     weight_map = safetensors_weight_map(download_hf_weight(model_path))
-    csf = any(".nvfp4_csf_fixed" in name for name in weight_map)
+    csf = any(name.endswith(".nvfp4_csf_fixed") for name in weight_map)
     kinds = list(kind_map)
     if csf:
         kinds += list(_CSF_KINDS)

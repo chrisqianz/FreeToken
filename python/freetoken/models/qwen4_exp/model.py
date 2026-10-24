@@ -40,7 +40,7 @@ logger = init_logger(__name__)
 def _resolve_ple_backend(requested: str, ple_embedding_dtype: str) -> str:
     """"disk" streams raw F8 rows through the C++ row store, which cannot unpack packed e2m1 rows; the NVFP4 PLE tables are always pinned."""
     if requested == "disk" and ple_embedding_dtype == "nvfp4":
-        logger.info_rank0("PLE table is packed e2m1 (nvfp4); the disk backend streams native rows only -- falling back to the pinned backend")
+        logger.warning_rank0("PLE table is packed e2m1 (nvfp4); the disk backend streams native rows only -- falling back to the pinned backend")
         return "pinned"
     return requested
 

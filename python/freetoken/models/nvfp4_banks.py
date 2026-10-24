@@ -27,9 +27,6 @@ class Nvfp4ExpertSourceSpec:
     # The checkpoint stores the QUANT-side global scale (local fp8 scales were
     # multiplied by it before the cast); the banks keep its reciprocal.
     global_reciprocal: bool = False
-    # Tensor kinds present in the checkpoint but never fetched (per-expert input
-    # scales are runtime quantities, not stored here).
-    ignored_kinds: frozenset[str] = frozenset()
     # The checkpoint stores the block scales as a lossless CSF slab pair instead of
     # the plain E4M3 matrix (e.g. "weight_scale.nvfp4_csf_fixed" /
     # "weight_scale.nvfp4_csf_exceptions"); scale_decoder expands the parts into the
@@ -117,16 +114,17 @@ def decode_csf_scales(fixed: torch.Tensor, exceptions: torch.Tensor) -> torch.Te
     bits = 4 * torch.arange(cols)
     scale = (base + ((codes[:, bits // 8] >> bits % 8) & 0x0F)) & 0xFF
     if exceptions.numel():
-        # CPU torch has no uint32 shifts; the same bit math in int32 is well defined,
-        # including (rec >> 24) & 0xFF for records with the sign bit set.
+        # Records are U32 on disk or raw U8 bytes; the bit math runs in int64 because CPU torch
+        # has no uint32 shifts and uint32 -> int32 casts wrap records with the sign bit set.
         rec = exceptions.reshape(-1)
         if rec.dtype == torch.uint8:
-            rec = rec.view(torch.int32)
-        elif rec.dtype != torch.int32:
-            rec = rec.to(torch.int32)
+            rec = rec.view(torch.uint32)
+        if rec.dtype not in (torch.uint32, torch.int32):
+            raise ValueError(f"CSF exceptions are U32 records (or U8 bytes), got {rec.dtype}")
+        rec = rec.to(torch.int64)
         scale = scale.to(torch.int32)
-        flat = scale.reshape(-1)
-        flat.scatter_(0, (rec & 0xFFFFFF).to(torch.int64), (rec >> 24) & 0xFF)
+        flat = scale.view(-1)
+        flat.scatter_(0, rec & 0xFFFFFF, ((rec >> 24) & 0xFF).to(torch.int32))
     return scale.to(torch.uint8).view(torch.float8_e4m3fn)
 
 
@@ -175,8 +173,6 @@ def iter_nvfp4_expert_pieces(
             raise ValueError(f"{spec.desc}: unknown NVFP4 expert projection {proj!r}")
         kind = _canon_kind(spec, match.group("kind"))
         role = spec.proj_to_role[proj]
-        if kind in spec.ignored_kinds:
-            continue
         if pair_kinds is not None:
             if kind in pair_kinds:
                 wanted[name] = (bank_layer, int(match.group("expert")), f"{role}~{kind}")
@@ -200,8 +196,8 @@ def iter_nvfp4_expert_pieces(
             del wanted[name]
         acts = []
     # A CSF checkpoint keeps every input_scale in its own trailing shard; streaming them
-    # with the weights makes the first piece wait on that shard while all other tensors
-    # pile up in `pending` (the 93% load stall). The CSF path reads them out of band.
+    # with the weights makes the first piece wait on that shard while every other tensor
+    # piles up unread in the queue. The CSF path reads them out of band instead.
     act_keys: dict[str, tuple[int, int, str]] = {}
     if pair_kinds is not None:
         for name in acts:
@@ -255,29 +251,31 @@ def iter_nvfp4_expert_pieces(
             for name in act_keys:
                 act_shards[weight_map[name]].append(name)
             for shard in tqdm(sorted(act_shards), desc=f"Loading {spec.desc} scales", disable=not primary):
-                with safetensors.safe_open(os.path.join(folder, shard), framework="pt", device="cpu") as f:
+                path = os.path.join(folder, shard)
+                _drop(path)
+                with safetensors.safe_open(path, framework="pt", device="cpu") as f:
                     for name in act_shards[shard]:
                         acts_in[name] = _ingest(spec, act, act_keys[name][2], f.get_tensor(name))
-        pending: dict[tuple[int, int], dict[str, torch.Tensor]] = {}
-        for name, tensor in _parallel() if parallel else _serial():
-            layer, expert, slot = wanted[name]
-            piece = pending.setdefault((layer, expert), {})
-            piece[slot] = tensor
-            if len(piece) != len(slots_per_expert):
-                continue
-            del pending[(layer, expert)]
+                _drop(path)
+
+        def _assemble(layer: int, expert: int, parts: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
             grouped: dict[str, torch.Tensor] = {}
             for role in roles:
-                grouped[role] = piece[role].unsqueeze(0)
-                grouped[f"{role}_global"] = piece[f"{role}_global"].reshape(1, -1)
+                grouped[role] = parts[role].unsqueeze(0)
+                grouped[f"{role}_global"] = parts[f"{role}_global"].reshape(1, -1)
                 if acts:
                     grouped[f"{role}_input"] = acts_in[act_index[(layer, expert, f"{role}_input")]].reshape(1, -1)
                 grouped[f"{role}_scale"] = decoder(
-                    *[piece[f"{role}~{kind}"] for kind in pair_kinds]
+                    *[parts[f"{role}~{kind}"] for kind in pair_kinds]
                 ).unsqueeze(0)
-            yield layer, expert, expert + 1, grouped
-        if pending:
-            raise ValueError(f"{spec.desc}: incomplete expert tensors for (layer, expert) {sorted(pending)[:8]}")
+            return grouped
+
+        yield from per_expert_pieces(
+            _parallel() if parallel else _serial(),
+            wanted.get,
+            tensors_per_expert=len(slots_per_expert),
+            assemble=_assemble,
+        )
 
     return _csf_pieces()
 
